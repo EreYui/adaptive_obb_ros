@@ -1,6 +1,7 @@
 #include "adaptive_obb/adaptive_obb.h"
 
 #include <limits>
+#include <stdexcept>
 
 #include <pcl/common/centroid.h>
 #include <pcl/common/pca.h>
@@ -119,23 +120,67 @@ void AdaptiveObb::constructBoundingBox(const Eigen::Vector3d& pos,
                            voxel_filter_leaf_size_);
   voxel_filter.filter(*local_filtered);
 
+  pcl::PointCloud<pcl::PointXYZI>::Ptr obb_cloud = local_filtered_ptr;
+  if (local_filtered_ptr->size() < 3 && local_cloud_ptr->size() >= 3) {
+    ROS_WARN_COND(global_verbosity >= Verbosity::WARN,
+                  "[AdaptiveObb] Filtered local cloud too sparse (%zu points), "
+                  "falling back to raw local cloud (%zu points).",
+                  local_filtered_ptr->size(), local_cloud_ptr->size());
+    obb_cloud = local_cloud_ptr;
+  }
+
+  if (obb_cloud->size() < 3) {
+    ROS_WARN_COND(global_verbosity >= Verbosity::WARN,
+                  "[AdaptiveObb] Local cloud too sparse for PCA (%zu points). "
+                  "Using identity fallback bounding box.",
+                  obb_cloud->size());
+    const double half_box = bounding_box_size_max_ / 2.0;
+    min_val = Eigen::Vector3d::Constant(-half_box);
+    max_val = Eigen::Vector3d::Constant(half_box);
+    rotations = Eigen::Vector3d::Zero();
+    mean_val = Eigen::Vector3d::Zero();
+    std_val = Eigen::Vector3d::Ones() * distribution_scaling_max_;
+    return;
+  }
+
   // Compute rotation matrix depending on selected method
-  Eigen::Matrix3d rot_w2b;
-  Eigen::Vector3d variance;
+  Eigen::Matrix3d rot_w2b = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d variance = Eigen::Vector3d::Ones();
 
   if (type_ == AdaptiveObbType::kPca) {
     // Matrix constructed from the vectors of the principal component analysis
     // Works bad in self-similar environments
-    pcl::PCA<pcl::PointXYZI> pca;
-    pca.setInputCloud(local_filtered_ptr);
-    rot_w2b = pca.getEigenVectors().cast<double>();
-    rot_w2b = rot_w2b / rot_w2b.determinant();  // Ensure right-handedness
-    rot_w2b.transposeInPlace();  // For the matrix to be body to world, the
-                                 // vector is tranposed
+    try {
+      pcl::PCA<pcl::PointXYZI> pca;
+      pca.setInputCloud(obb_cloud);
+      rot_w2b = pca.getEigenVectors().cast<double>();
+      const double det = rot_w2b.determinant();
+      if (!std::isfinite(det) || std::abs(det) < 1e-6) {
+        throw std::runtime_error("invalid PCA eigenvector determinant");
+      }
+      rot_w2b = rot_w2b / det;  // Ensure right-handedness
+      rot_w2b.transposeInPlace();  // For the matrix to be body to world, the
+                                   // vector is tranposed
 
-    double cloud_size = local_filtered->size();
-    variance = pca.getEigenValues().cast<double>() / (cloud_size - 1);
-    variance.cwiseAbs();
+      const double cloud_size = static_cast<double>(obb_cloud->size());
+      variance = pca.getEigenValues().cast<double>() / (cloud_size - 1.0);
+      variance = variance.cwiseAbs();
+      if (!variance.allFinite()) {
+        throw std::runtime_error("invalid PCA variance");
+      }
+    } catch (const std::exception& ex) {
+      ROS_WARN_COND(global_verbosity >= Verbosity::WARN,
+                    "[AdaptiveObb] PCA failed (%s). Using identity fallback "
+                    "bounding box.",
+                    ex.what());
+      const double half_box = bounding_box_size_max_ / 2.0;
+      min_val = Eigen::Vector3d::Constant(-half_box);
+      max_val = Eigen::Vector3d::Constant(half_box);
+      rotations = Eigen::Vector3d::Zero();
+      mean_val = Eigen::Vector3d::Zero();
+      std_val = Eigen::Vector3d::Ones() * distribution_scaling_max_;
+      return;
+    }
   }
 
   // Change to a representation convertible to euler angles
@@ -144,7 +189,7 @@ void AdaptiveObb::constructBoundingBox(const Eigen::Vector3d& pos,
   // Compute offset to center of bounding box
   // The center coincides with center of poincloud
   Eigen::Vector4f centroid_out;
-  pcl::compute3DCentroid(*local_filtered, centroid_out);
+  pcl::compute3DCentroid(*obb_cloud, centroid_out);
 
   Eigen::Vector3d pos_c = centroid_out.head(3).cast<double>();
   Eigen::Vector3d offset = rot_w2b * (pos_c - pos);
@@ -154,6 +199,13 @@ void AdaptiveObb::constructBoundingBox(const Eigen::Vector3d& pos,
   // reference frame
   Eigen::Vector3d sigma = variance.cwiseSqrt();
   double sigma_max = sigma.maxCoeff();
+  if (!sigma.allFinite() || !std::isfinite(sigma_max) || sigma_max < 1e-6) {
+    ROS_WARN_COND(global_verbosity >= Verbosity::WARN,
+                  "[AdaptiveObb] Degenerate PCA sigma detected. Using isotropic "
+                  "fallback scale.");
+    sigma = Eigen::Vector3d::Ones();
+    sigma_max = 1.0;
+  }
 
   min_val = offset - sigma / sigma_max * bounding_box_size_max_ / 2;
   max_val = offset + sigma / sigma_max * bounding_box_size_max_ / 2;
